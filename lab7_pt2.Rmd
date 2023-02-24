@@ -1,0 +1,142 @@
+---
+title: 'Lab 7 Pt 2: Spatial Interpolation and Kriging'
+author: "Nick McManus"
+date: "2023-02-23"
+output: html_document
+---
+
+```{r setup, include=FALSE, message = F, warning = F}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F)
+library(tidyverse)
+library(tmap)
+library(here)
+library(sf)
+library(gstat)
+library(stars)
+```
+
+
+## Read in CA depth to groundwater data
+
+NOTE: ctrl+shft+C will comment/uncomment code
+
+```{r}
+## read in counties data
+ca_counties_sf <- read_sf(here('data/ca_counties'),
+                          layer = 'CA_Counties_TIGER2016') %>% 
+  janitor::clean_names() %>% 
+  select(name)
+
+st_crs(ca_counties_sf)
+#3857
+
+
+## read in groundwater depth data
+ca_dgw_sf <- read_sf(here('data/ca_dgw/F2013_DBGS_Points_20150720_093252.gpkg')) %>% 
+  janitor::clean_names()
+
+st_crs(ca_dgw_sf)
+#4326
+
+## Transform DGW data to same CRS as CA counties
+ca_dgw_sf <- st_transform(ca_dgw_sf, crs = st_crs(ca_counties_sf))
+
+## Make quick ggplot
+ggplot()+
+  geom_sf(data = ca_counties_sf) +
+  geom_sf(data = ca_dgw_sf, aes(color = dgbs)) +
+  scale_color_gradient(low = 'cyan', high = 'dodgerblue4')
+
+tmap_mode('view')
+tm_shape(ca_dgw_sf) +
+  tm_dots('dgbs', palette = 'Blues')
+
+# tmaptools::palette_explorer()
+```
+
+
+
+## Wrangle to just San Joaquin County
+
+```{r}
+sj_county_sf <- ca_counties_sf %>% 
+  filter(name %in% 'San Joaquin') #could also put in vector of names to select more counties
+
+sj_depth_sf <- ca_dgw_sf %>% 
+  st_intersection(sj_county_sf)
+
+ggplot() +
+  geom_sf(data = sj_county_sf) +
+  geom_sf(data = sj_depth_sf, aes(color = dgbs)) +
+  theme_void() +
+  scale_color_viridis_c()
+```
+
+
+
+## Set up for kriging
+
+```{r}
+well_duplicates <- sj_depth_sf %>% 
+  janitor::get_dupes(latitude, longitude)
+
+sj_depth_sf <- sj_depth_sf %>% 
+  ##look for wells with id in the dupes, then remove them!
+  filter(!local_well %in% well_duplicates$local_well)
+```
+
+
+## Make a variogram!
+
+```{r}
+sj_dgw_vgm <- gstat::variogram(dgbs ~ 1, data = sj_depth_sf)
+
+plot(sj_dgw_vgm)
+
+sj_dgw_vgm_fit <- fit.variogram(sj_dgw_vgm, 
+                                model = vgm(model = 'Gau',
+                                nugget = 20,
+                                sill = 3000,
+                                range = 30000))
+
+plot(sj_dgw_vgm, sj_dgw_vgm_fit)
+
+attr(sj_dgw_vgm_fit, 'SSErr')
+```
+
+
+## Spatial kriging
+
+```{r}
+### what is the smallest box you can draw around the county?
+### creating extent in which to work
+sj_grid <- st_bbox(sj_county_sf) %>% 
+  ##creates spatial array of 1000 squares
+  stars::st_as_stars(dx = 1000, dy = 1000) %>% 
+  st_crop(sj_county_sf)
+```
+
+
+```{r}
+### ~1 is fxn of intercept (rather than known variables)
+sj_dgw_krige <- krige(dgbs ~ 1, sj_depth_sf, sj_grid,
+                      model = sj_dgw_vgm_fit)
+
+plot(sj_dgw_krige)
+
+krige_df <- as.data.frame(sj_dgw_krige) %>%
+  st_as_sf(coords = c('x','y')) %>% 
+  drop_na(var1.pred)
+st_crs(krige_df) <- 3857
+
+ggplot(data = krige_df) +
+  geom_sf(aes(color = var1.pred)) +
+  scale_color_gradient(low = 'blue', high = 'yellow')
+```
+
+
+
+
+
+
+
